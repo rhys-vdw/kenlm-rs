@@ -34,6 +34,34 @@ pub type Result<T> = std::result::Result<T, KenlmError>;
 /// KenLM vocabulary index.
 pub type WordIndex = u32;
 
+/// KenLM's compiled maximum n-gram order, from `build.rs`.
+const MAX_ORDER: usize = parse_order(env!("KENLM_RS_MAX_ORDER"));
+
+/// Inline capacity of a [`State`], in `u64`s. `lm::ngram::State` holds
+/// `MAX_ORDER - 1` word indices and as many backoffs (4 bytes each) plus a
+/// length byte, which always fits in `MAX_ORDER` `u64`s. `u64` also gives the
+/// buffer the alignment KenLM needs when it casts it to its state type.
+const STATE_WORDS: usize = MAX_ORDER;
+
+/// Inline capacity of a [`State`], in bytes.
+const STATE_BYTES: usize = STATE_WORDS * std::mem::size_of::<u64>();
+
+const fn parse_order(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut order = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        assert!(
+            bytes[index].is_ascii_digit(),
+            "KENLM_MAX_ORDER must be a number"
+        );
+        order = order * 10 + (bytes[index] - b'0') as usize;
+        index += 1;
+    }
+    assert!(order >= 2, "KENLM_MAX_ORDER must be at least 2");
+    order
+}
+
 /// Convert an ARPA file to an unquantized probing binary. Output must differ
 /// from input; callers should use a temporary output and publish on success.
 pub fn build_binary(input: impl AsRef<Path>, output: impl AsRef<Path>) -> Result<()> {
@@ -84,9 +112,10 @@ extern "C" {
     fn kenlm_model_order(model: *const RawModel) -> u8;
     fn kenlm_model_begin_sentence_write(model: *const RawModel, state: *mut c_void);
     fn kenlm_model_null_context_write(model: *const RawModel, state: *mut c_void);
-    fn kenlm_model_try_index(
+    fn kenlm_model_try_index_len(
         model: *const RawModel,
         word: *const c_char,
+        length: usize,
         out: *mut c_uint,
     ) -> c_int;
     fn kenlm_model_begin_sentence_index(model: *const RawModel) -> c_uint;
@@ -111,7 +140,7 @@ extern "C" {
 /// Errors returned by the KenLM bindings.
 #[derive(Debug)]
 pub enum KenlmError {
-    /// A path or word contained an interior NUL byte and cannot cross the C ABI.
+    /// A path contained an interior NUL byte and cannot cross the C ABI.
     InteriorNul(NulError),
     /// KenLM could not load the requested model.
     Load(String),
@@ -220,7 +249,6 @@ impl Default for Config {
 /// A KenLM model loaded from an ARPA or KenLM binary file.
 pub struct Model {
     raw: NonNull<RawModel>,
-    state_size: usize,
     token: Arc<ModelToken>,
 }
 
@@ -250,11 +278,19 @@ impl Model {
         // SAFETY: `raw` is a non-null KenLM handle returned by
         // `kenlm_model_load` and remains owned by `Self` until `Drop`.
         let state_size = unsafe { kenlm_model_state_size(raw.as_ptr()) };
-        Ok(Self {
+        let model = Self {
             raw,
-            state_size,
             token: Arc::new(ModelToken),
-        })
+        };
+        // A prebuilt library compiled with a larger maximum order would
+        // overflow `State`'s inline buffer.
+        if state_size > STATE_BYTES {
+            return Err(KenlmError::Load(format!(
+                "KenLM state size {state_size} exceeds the {STATE_BYTES} bytes \
+                 supported by KENLM_MAX_ORDER={MAX_ORDER}; rebuild with a larger order"
+            )));
+        }
+        Ok(model)
     }
 
     /// Return the n-gram order of the model.
@@ -269,12 +305,22 @@ impl Model {
     }
 
     /// Return KenLM's vocabulary index for `word`, or the not-found index for OOV words.
+    ///
+    /// The lookup doesn't allocate: KenLM takes the word as a pointer and
+    /// length, so it needs no NUL terminator. A word containing a NUL byte is
+    /// simply out of vocabulary.
     pub fn index(&self, word: &str) -> Result<WordIndex> {
-        let word = CString::new(word)?;
-        // SAFETY: `self.raw` is live and `word` is a valid NUL-terminated C
-        // string for the duration of the call.
         let mut index = 0;
-        let status = unsafe { kenlm_model_try_index(self.raw.as_ptr(), word.as_ptr(), &mut index) };
+        // SAFETY: `self.raw` is live, and `word` is valid for `word.len()`
+        // bytes for the duration of the call. KenLM reads exactly that range.
+        let status = unsafe {
+            kenlm_model_try_index_len(
+                self.raw.as_ptr(),
+                word.as_ptr().cast(),
+                word.len(),
+                &mut index,
+            )
+        };
         if status == 0 {
             Ok(index as WordIndex)
         } else {
@@ -380,8 +426,8 @@ impl Model {
     /// Create a state initialized to beginning-of-sentence context.
     pub fn begin_sentence_state(&self) -> State {
         let mut state = self.empty_state();
-        // SAFETY: `state` is exactly `self.state_size` bytes and belongs to
-        // this model. KenLM writes a POD state into the provided buffer.
+        // SAFETY: `state` belongs to this model, and loading checked that its
+        // inline buffer holds at least KenLM's state size. KenLM writes a POD state into the provided buffer.
         unsafe {
             kenlm_model_begin_sentence_write(self.raw.as_ptr(), state.as_mut_ptr());
         }
@@ -391,8 +437,8 @@ impl Model {
     /// Create a state initialized to null context.
     pub fn null_context_state(&self) -> State {
         let mut state = self.empty_state();
-        // SAFETY: `state` is exactly `self.state_size` bytes and belongs to
-        // this model. KenLM writes a POD state into the provided buffer.
+        // SAFETY: `state` belongs to this model, and loading checked that its
+        // inline buffer holds at least KenLM's state size. KenLM writes a POD state into the provided buffer.
         unsafe {
             kenlm_model_null_context_write(self.raw.as_ptr(), state.as_mut_ptr());
         }
@@ -412,8 +458,8 @@ impl Model {
         // and `&mut State`; KenLM additionally requires distinct buffers.
         debug_assert!(!std::ptr::eq(in_state.as_ptr(), out_state.as_ptr()));
         let mut score = 0.0;
-        // SAFETY: states were created by this model and have the exact byte
-        // size KenLM reported. Input and output buffers are distinct. The C++
+        // SAFETY: states were created by this model, whose state size fits
+        // their inline buffers. Input and output buffers are distinct. The C++
         // wrapper catches exceptions and reports them through its status code.
         let status = unsafe {
             kenlm_model_try_base_score(
@@ -450,8 +496,8 @@ impl Model {
             extend_left: 0,
             rest: 0.0,
         };
-        // SAFETY: states were created by this model and have the exact byte
-        // size KenLM reported. Input and output buffers are distinct. The C++
+        // SAFETY: states were created by this model, whose state size fits
+        // their inline buffers. Input and output buffers are distinct. The C++
         // wrapper catches exceptions and reports them through its status code.
         let status = unsafe {
             kenlm_model_try_base_full_score(
@@ -484,13 +530,14 @@ impl Model {
 
     fn empty_state(&self) -> State {
         State {
-            bytes: vec![0; self.state_size],
+            words: [0; STATE_WORDS],
             owner: Arc::clone(&self.token),
         }
     }
 
     fn validate_state(&self, state: &State) -> Result<()> {
-        if state.bytes.len() != self.state_size || !Arc::ptr_eq(&state.owner, &self.token) {
+        // Loading checked that this model's states fit the inline buffer.
+        if !Arc::ptr_eq(&state.owner, &self.token) {
             return Err(KenlmError::StateModelMismatch);
         }
         Ok(())
@@ -508,25 +555,28 @@ impl Drop for Model {
 }
 
 /// Opaque KenLM state memory used for incremental scoring.
+///
+/// The state is stored inline, so creating or cloning one doesn't allocate.
+/// KenLM uses the model's first `StateSize()` bytes; the rest stay zero.
 #[derive(Clone, Debug)]
 pub struct State {
-    bytes: Vec<u8>,
+    words: [u64; STATE_WORDS],
     owner: Arc<ModelToken>,
 }
 
 impl State {
     fn as_ptr(&self) -> *const c_void {
-        self.bytes.as_ptr().cast()
+        self.words.as_ptr().cast()
     }
 
     fn as_mut_ptr(&mut self) -> *mut c_void {
-        self.bytes.as_mut_ptr().cast()
+        self.words.as_mut_ptr().cast()
     }
 }
 
 impl PartialEq for State {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.owner, &other.owner) && self.bytes == other.bytes
+        Arc::ptr_eq(&self.owner, &other.owner) && self.words == other.words
     }
 }
 
@@ -628,6 +678,23 @@ mod tests {
     }
 
     #[test]
+    fn index_reads_only_the_given_bytes() {
+        let config = Config {
+            show_progress: false,
+            ..Config::default()
+        };
+        let model = Model::with_config("lm/test.arpa", config).unwrap();
+
+        let looking = model.index("looking").unwrap();
+        assert_ne!(looking, model.not_found_index());
+        // A slice of a longer string isn't NUL-terminated where it ends.
+        assert_eq!(model.index(&"looking on"[..7]).unwrap(), looking);
+        assert_eq!(model.index("").unwrap(), model.not_found_index());
+        // Words with a NUL byte are out of vocabulary rather than an error.
+        assert_eq!(model.index("look\0ing").unwrap(), model.not_found_index());
+    }
+
+    #[test]
     fn supports_stateful_scoring() {
         let config = Config {
             show_progress: false,
@@ -647,6 +714,30 @@ mod tests {
             .base_full_score(&state, model.end_sentence_index(), &mut out)
             .unwrap();
         assert!(full.log_prob.is_finite());
+    }
+
+    #[test]
+    fn inline_states_fit_and_score_like_whole_sentences() {
+        let config = Config {
+            show_progress: false,
+            ..Config::default()
+        };
+        let model = Model::with_config("lm/test.arpa", config).unwrap();
+        assert_eq!(model.begin_sentence_state(), model.begin_sentence_state());
+
+        let words = ["looking", "on", "a", "little"];
+        let mut state = model.begin_sentence_state();
+        let mut total = 0.0;
+        for word in words {
+            // Scoring from a clone must match scoring from the original.
+            let parent = state.clone();
+            let mut next = model.null_context_state();
+            total += model
+                .base_score(&parent, model.index(word).unwrap(), &mut next)
+                .unwrap();
+            state = next;
+        }
+        assert_eq!(total, model.score_words(words, true, false).unwrap());
     }
 
     #[test]
